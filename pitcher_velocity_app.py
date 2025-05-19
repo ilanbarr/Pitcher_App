@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-Pitcher Performance Dashboard
-============================
+Pitcher Performance Dashboard (v3)
+=================================
 
-* Streamlit UI with drill‑down charts **and** CLI fallback
-* Metrics: **velocity, movement (pfx_x / pfx_z), spin‑rate, whiff%, barrel%**
-* Compatible with both old and new Streamlit APIs (no deprecated attributes)
+**What’s new**
+--------------
+* **Trend lines** added for
+  * Whiff % over time
+  * Barrel % over time
+  * Horizontal & vertical movement (inches) over time
+  * xwOBA / wOBA over time
+* Aggregate logic now converts movement to inches (`h_in`, `v_in`) so they’re
+  easier to read and chart.
+* UI stays single‑page: each metric gets its own simple line chart (no subplots).
+* CLI unchanged.
 
----
-CLI:
-```bash
-python pitcher_app.py --date 2025-05-19
-```
-Streamlit:
+Run UI:
 ```bash
 streamlit run pitcher_app.py
-```
-Dependencies:
-```
-pip install pandas requests "pybaseball>=2.2" streamlit matplotlib
 ```
 """
 from __future__ import annotations
@@ -31,12 +30,11 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import requests
 
-# Optional heavy deps (only loaded when UI)
 try:
-    import streamlit as st  # type: ignore
-    from streamlit.runtime.scriptrunner import get_script_run_ctx  # type: ignore
-    import matplotlib.pyplot as plt  # type: ignore
-except ModuleNotFoundError:  # running in CLI‑only environment
+    import streamlit as st
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
     st = None  # type: ignore
 
 from pybaseball import statcast_pitcher
@@ -48,30 +46,26 @@ HEADSHOT_TEMPLATE = (
 )
 
 # ---------------------------------------------------------------------------
-# Helper – detect Streamlit context
+# Helpers
 # ---------------------------------------------------------------------------
 
 def in_streamlit() -> bool:
     return st is not None and get_script_run_ctx() is not None  # type: ignore[arg-type]
 
 # ---------------------------------------------------------------------------
-# Data fetch / caching
+# Data fetch
 # ---------------------------------------------------------------------------
 
 def get_probable_pitchers(date: dt.date) -> List[Dict]:
-    """Return list[{id,name}] of probable starters for *date*."""
     params = {"sportId": 1, "hydrate": "probablePitcher", "date": date.isoformat()}
     r = requests.get(MLB_SCHEDULE_URL, params=params, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    pitchers = []
-    for d in data.get("dates", []):
+    pitchers: list[dict] = []
+    for d in r.json().get("dates", []):
         for g in d.get("games", []):
             for side in ("home", "away"):
-                entry = g["teams"][side].get("probablePitcher")
-                if entry:
-                    pitchers.append({"id": entry["id"], "name": entry["fullName"]})
-    # dedupe
+                if (pp := g["teams"][side].get("probablePitcher")):
+                    pitchers.append({"id": pp["id"], "name": pp["fullName"]})
     return [{"id": k, "name": v} for k, v in {p["id"]: p["name"] for p in pitchers}.items()]
 
 
@@ -80,7 +74,7 @@ if st is not None:
     def fetch_pitcher_statcast(pid: int, start: dt.date, end: dt.date) -> pd.DataFrame:  # type: ignore
         try:
             return statcast_pitcher(start.isoformat(), end.isoformat(), pid)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             st.error(f"Statcast query failed for {pid}: {exc}")
             return pd.DataFrame()
 else:
@@ -95,8 +89,7 @@ else:
 # ---------------------------------------------------------------------------
 
 def add_pitch_flags(df: pd.DataFrame) -> pd.DataFrame:
-    """Add helper boolean columns: swing, miss, barrel."""
-    descriptions_miss = {
+    miss_set = {
         "swinging_strike",
         "swinging_strike_blocked",
         "swinging_pitchout",
@@ -112,19 +105,14 @@ def add_pitch_flags(df: pd.DataFrame) -> pd.DataFrame:
             "hit_into_play_no_out",
         ]
     )
-    df["is_miss"] = df["description"].isin(descriptions_miss)
-
-    # Barrel according to simple rule of launch_speed ≥ 98 & 26° ≥ launch_angle ≥ 8°
+    df["is_miss"] = df["description"].isin(miss_set)
     df["is_barrel"] = (
-        (df["launch_speed"] >= 98)
-        & (df["launch_angle"] >= 8)
-        & (df["launch_angle"] <= 26)
+        (df["launch_speed"] >= 98) & df["launch_angle"].between(8, 26)
     )
     return df
 
 
 def aggregate_metrics(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return appearance‑level aggregated metrics & latest‑game deltas."""
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -141,19 +129,26 @@ def aggregate_metrics(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         misses=("is_miss", "sum"),
         barrels=("is_barrel", "sum"),
         pitches=("pitch_type", "size"),
+        woba_value=("woba_value", "mean"),
+        xwoba=("estimated_woba_using_speedangle", "mean"),
     )
     agg["whiff%"] = (agg["misses"] / agg["swings"]).round(3)
     agg["barrel%"] = (agg["barrels"] / agg["pitches"]).round(3)
+    agg["wOBA"] = agg["woba_value"].round(3)
+    agg["xwOBA"] = agg["xwoba"].round(3)
 
-    # velocity deltas (keep for convenience)
+    # movement to inches (more intuitive)
+    agg["h_in"] = (agg["avg_hmov"] * 12).round(2)
+    agg["v_in"] = (agg["avg_vmov"] * 12).round(2)
+
+    # ΔV baseline
     agg = agg.sort_values("game_date")
     agg["baseline_v"] = (
         agg.groupby("pitch_type")["avg_v"].transform(lambda s: s.shift(1).rolling(3, min_periods=3).mean())
     )
     agg["delta_v"] = agg["avg_v"] - agg["baseline_v"]
 
-    latest_date = agg["game_date"].max()
-    latest = agg[agg["game_date"] == latest_date].copy()
+    latest = agg[agg["game_date"] == agg["game_date"].max()].copy()
     return agg, latest
 
 
@@ -172,85 +167,83 @@ def summarize_pitcher(pid: int, name: str, today: dt.date, lookback: int = 35):
 if in_streamlit():
     st.set_page_config("Pitcher Dashboard", "⚾", layout="wide")
 
-    # unified query‑param helpers (list→str)
+    # ------ Query‑param helpers ------
     def qp_get(key: str, default: str | None = None):
         if hasattr(st, "query_params"):
-            qp = st.query_params  # proxy
+            proxy = st.query_params
         else:
-            qp = st.experimental_get_query_params()  # type: ignore[attr-defined]
-        if key in qp:
-            v = qp[key]
+            proxy = st.experimental_get_query_params()  # type: ignore[attr-defined]
+        if key in proxy:
+            v = proxy[key]
             return v[0] if isinstance(v, list) else v
         return default
 
-    def qp_set(**kwargs):
+    def qp_clear():
         if hasattr(st, "query_params"):
-            st.query_params.update(kwargs)  # type: ignore[attr-defined]
+            st.query_params.clear()  # type: ignore[attr-defined]
         else:
-            st.experimental_set_query_params(**kwargs)  # type: ignore[attr-defined]
+            st.experimental_set_query_params()
 
-    # DETAIL VIEW -----------------------------------------------------------
+    # DETAIL PAGE --------------------------------------------------------
     if qp_get("pid") is not None:
         pid = int(qp_get("pid"))
         name = qp_get("name", "Unknown")
         sel_date = dt.date.fromisoformat(qp_get("date", dt.date.today().isoformat()))
         lookback = int(qp_get("lookback", "35"))
 
-        st.markdown(f"## {name} – Recent Trends")
+        st.markdown(f"## {name} — Trends (last {lookback} days)")
         st.image(HEADSHOT_TEMPLATE.format(pid=pid, size=200), width=150)
 
         agg_df, latest_df, raw_df = summarize_pitcher(pid, name, sel_date, lookback)
         if agg_df is None:
             st.error("No Statcast data available.")
         else:
-            # --- Line charts (velocity & spin)
-            for metric, ylabel in [("avg_v", "Velocity (mph)"), ("avg_spin", "Spin Rate (RPM)")]:
+            # --- helper to make clean line charts ---
+            def line_chart(metric: str, ylabel: str):
                 plt.figure(figsize=(9, 4))
                 for pt, grp in agg_df.groupby("pitch_type"):
                     plt.plot(grp["game_date"], grp[metric], marker="o", label=pt)
-                plt.xlabel("Game Date")
-                plt.ylabel(ylabel)
-                plt.title(f"{name} – {ylabel.split()[0]} by Pitch Type")
-                plt.xticks(rotation=45)
-                plt.legend()
-                st.pyplot(plt.gcf())
-                plt.clf()
+                plt.xlabel("Game Date"); plt.ylabel(ylabel)
+                plt.title(f"{name} — {ylabel} by Pitch Type")
+                plt.xticks(rotation=45); plt.legend(); st.pyplot(plt.gcf()); plt.clf()
 
-            # --- Movement scatter (latest appearance)
-            st.markdown("### Latest Game Movement vs Spin")
-            if not latest_df.empty:
-                plt.figure(figsize=(6, 5))
-                plt.scatter(latest_df["avg_hmov"], latest_df["avg_vmov"], s=100)
-                for _, row in latest_df.iterrows():
-                    plt.text(row["avg_hmov"], row["avg_vmov"], row["pitch_type"])
-                plt.xlabel("Horiz. Movement (pfx_x, ft)")
-                plt.ylabel("Vert. Movement (pfx_z, ft)")
-                plt.axhline(0, ls=":", lw=0.5)
-                plt.axvline(0, ls=":", lw=0.5)
-                st.pyplot(plt.gcf())
-                plt.clf()
+            # velocity / spin
+            line_chart("avg_v", "Velocity (mph)")
+            line_chart("avg_spin", "Spin Rate (RPM)")
+            # whiff / barrel
+            line_chart("whiff%", "Whiff Rate")
+            line_chart("barrel%", "Barrel Rate")
+            # movement
+            line_chart("h_in", "Horizontal Break (in)")
+            line_chart("v_in", "Vertical Break (in)")
+            # xwOBA / wOBA
+            line_chart("xwOBA", "xwOBA")
+            line_chart("wOBA", "wOBA")
 
-            # --- Latest metrics table
-            st.markdown("### Latest Appearance Summary")
-            latest_cols = [
-                "pitch_type",
-                "avg_v",
-                "delta_v",
-                "avg_spin",
-                "whiff%",
-                "barrel%",
-            ]
-            st.dataframe(latest_df[latest_cols].round(3), use_container_width=True)
+            # Latest metrics table
+            if latest_df is not None and not latest_df.empty:
+                st.markdown("### Latest Appearance Metrics")
+                cols = [
+                    "pitch_type",
+                    "avg_v",
+                    "delta_v",
+                    "avg_spin",
+                    "whiff%",
+                    "barrel%",
+                    "wOBA",
+                    "xwOBA",
+                    "h_in",
+                    "v_in",
+                ]
+                st.dataframe(latest_df[cols].round(3), use_container_width=True)
 
-            # Raw data
             with st.expander("Raw Statcast (recent)"):
                 st.dataframe(raw_df, use_container_width=True)
 
-        # Back button resets query params
         if st.button("← Back to list"):
-            qp_set()  # clears all
+            qp_clear()
 
-    # MAIN DASHBOARD --------------------------------------------------------
+    # MAIN DASHBOARD -----------------------------------------------------
     else:
         st.title("⚾ Pitcher Performance Dashboard")
         with st.sidebar:
@@ -264,36 +257,37 @@ if in_streamlit():
             if not probables:
                 st.warning("No probable starters found.")
             else:
-                st.success(f"Found {len(probables)} pitchers.")
                 for p in probables:
-                    agg_df, latest_df, _ = summarize_pitcher(p["id"], p["name"], sel_date, lookback)
+                    _, latest_df, _ = summarize_pitcher(p["id"], p["name"], sel_date, lookback)
                     if latest_df is None or latest_df.empty:
-                        st.info(f"No Statcast data for {p['name']}")
                         continue
+
                     delta_min = latest_df["delta_v"].min()
                     whiff_max = latest_df["whiff%"].max()
                     barrel_max = latest_df["barrel%"].max()
+                    xwoba_mean = latest_df["xwOBA"].mean()
                     headshot = HEADSHOT_TEMPLATE.format(pid=p["id"], size=150)
 
-                    card = st.container(border=True)
-                    with card:
+                    with st.container(border=True):
                         c1, c2 = st.columns([1, 3])
                         with c1:
                             st.image(headshot, width=120)
                         with c2:
                             st.subheader(p["name"])
                             st.markdown(
-                                f"**Largest ΔV:** {delta_min:+.2f} mph   |  "
-                                f"**Peak Whiff%:** {whiff_max:.0%}   |  "
-                                f"**Peak Barrel%:** {barrel_max:.0%}"
+                                f"**ΔV (min):** {delta_min:+.2f} mph | "
+                                f"**Whiff% (max):** {whiff_max:.0%} | "
+                                f"**Barrel% (max):** {barrel_max:.0%} | "
+                                f"**xwOBA (avg):** {xwoba_mean:.3f}"
                             )
-                            params = {
-                                "pid": p["id"],
-                                "name": p["name"],
-                                "date": sel_date.isoformat(),
-                                "lookback": lookback,
-                            }
-                            url = f"?{urllib.parse.urlencode(params)}"
+                            url = "?" + urllib.parse.urlencode(
+                                {
+                                    "pid": p["id"],
+                                    "name": p["name"],
+                                    "date": sel_date.isoformat(),
+                                    "lookback": lookback,
+                                }
+                            )
                             st.link_button("Details ➜", url)
 
 # ---------------------------------------------------------------------------
@@ -301,36 +295,41 @@ if in_streamlit():
 # ---------------------------------------------------------------------------
 
 def cli_main(date_iso: str | None = None):
-    today = dt.date.fromisoformat(date_iso) if date_iso else dt.date.today()
-    probables = get_probable_pitchers(today)
-    if not probables:
-        print("No probable starters.")
-        return
+    date = dt.date.fromisoformat(date_iso) if date_iso else dt.date.today()
+    probables = get_probable_pitchers(date)
     frames = []
     for p in probables:
-        _, latest_df, _ = summarize_pitcher(p["id"], p["name"], today)
+        _, latest_df, _ = summarize_pitcher(p["id"], p["name"], date)
         if latest_df is not None:
             latest_df["pitcher"] = p["name"]
             frames.append(latest_df)
+
     if not frames:
-        print("No recent Statcast data.")
+        print("No recent Statcast data for probable starters.")
         return
-    report = pd.concat(frames)[
-        [
-            "pitcher",
-            "pitch_type",
-            "avg_v",
-            "delta_v",
-            "avg_spin",
-            "whiff%",
-            "barrel%",
-        ]
-    ].round(2)
-    print(report.sort_values(["pitcher", "delta_v"]))
+
+    report = (
+        pd.concat(frames)
+            [
+                "pitcher",
+                "pitch_type",
+                "avg_v",
+                "delta_v",
+                "avg_spin",
+                "whiff%",
+                "barrel%",
+                "wOBA",
+                "xwOBA",
+            ]
+            .round(3)
+            .sort_values(["pitcher", "delta_v"])
+        )
+    
+    print(report.to_string(index=False))
 
 
 if __name__ == "__main__" and not in_streamlit():
-    parser = argparse.ArgumentParser("Pitcher performance CLI")
-    parser.add_argument("--date", help="YYYY-MM-DD (default today)")
-    args = parser.parse_args()
+    argp = argparse.ArgumentParser("Pitcher performance CLI")
+    argp.add_argument("--date", help="YYYY-MM-DD (default today)")
+    args = argp.parse_args()
     cli_main(args.date)
