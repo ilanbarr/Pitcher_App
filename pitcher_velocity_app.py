@@ -149,8 +149,8 @@ def aggregate_metrics(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rest_df = (
         agg.drop_duplicates("game_date")
            .sort_values("game_date")[["game_date"]]
-           .assign(rest_days=lambda d: d["game_date"].diff().dt.days)
-    )
+           .assign(rest_days=lambda d: pd.to_datetime(d["game_date"]).diff().dt.days).dt.days)
+    
     agg = agg.merge(rest_df, on="game_date", how="left")
 
     latest = agg[agg["game_date"] == agg["game_date"].max()].copy()
