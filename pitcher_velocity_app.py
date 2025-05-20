@@ -146,11 +146,12 @@ def aggregate_metrics(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     agg["delta_v"] = agg["avg_v"] - agg["baseline_v"]
 
         # rest days between appearances — compute on unique dates then merge back
+        # rest days between appearances — compute on unique dates then merge back
     rest_df = (
         agg.drop_duplicates("game_date")
            .sort_values("game_date")[["game_date"]]
-           .assign(rest_days=lambda d: pd.to_datetime(d["game_date"]).diff().dt.days).dt.days)
-    
+           .assign(rest_days=lambda d: pd.to_datetime(d["game_date"]).diff().dt.days)
+    )
     agg = agg.merge(rest_df, on="game_date", how="left")
 
     latest = agg[agg["game_date"] == agg["game_date"].max()].copy()
